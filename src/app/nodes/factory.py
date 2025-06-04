@@ -1,3 +1,4 @@
+# NOTE: All node logic is handled by AiNode, which supports both deterministic and agentic workflows via the agentic flag. There are no other node types at this time.
 from app.nodes.ai_node import AiNode
 # from app.nodes.tool_node import ToolNode  # (future)
 # from app.nodes.router_node import RouterNode  # (future)

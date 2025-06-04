@@ -2,6 +2,8 @@
 
 This folder contains JSON Schemas and example configurations for multi-provider, multi-level ScriptChain workflows.
 
+**Note:** Only `AiNode` is supported as a node type. All tool/function calling is handled via the `agentic` flag (for multi-step vs. single-step behavior) and backend-injected tool schemas. There are no other node types at this time.
+
 - `node_config.schema.json`: Node configuration schema
 - `node_metadata.schema.json`: Node metadata schema
 - `script_chain.schema.json`: ScriptChain configuration schema

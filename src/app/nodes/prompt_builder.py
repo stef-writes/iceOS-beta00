@@ -7,27 +7,49 @@ from app.nodes.constants import TOOL_INSTRUCTION
 # Standalone function for building the tool preamble
 
 def build_tool_preamble(tools: list) -> str:
-    """Generate a human-readable preamble describing available tools, their parameters, and usage examples."""
+    """Generate a robust, LLM-friendly preamble describing available tools, their parameters, and usage examples."""
     if not tools:
         return ""
-    lines = [TOOL_INSTRUCTION, "\nYou have access to the following tools:"]
+    lines = [
+        "SYSTEM: You have access to the following tools:",
+        ""
+    ]
     for tool in tools:
         params = tool.get('parameters_schema', {}).get('properties', {})
         required = set(tool.get('parameters_schema', {}).get('required', []))
         param_strs = []
+        example_args = {}
         for k, v in params.items():
             typ = v.get('type', 'unknown')
             desc = v.get('description', '')
             req = 'required' if k in required else 'optional'
             param_strs.append(f"{k} ({typ}, {req}){': ' + desc if desc else ''}")
+            # Generate a realistic example value
+            if typ == 'string':
+                example_args[k] = f"example_{k}_value"
+            elif typ == 'integer':
+                example_args[k] = 1
+            elif typ == 'number':
+                example_args[k] = 1.0
+            elif typ == 'boolean':
+                example_args[k] = True
+            elif typ == 'array':
+                example_args[k] = []
+            elif typ == 'object':
+                example_args[k] = {}
+            else:
+                example_args[k] = f"example_{k}"
         param_str = ", ".join(param_strs) if param_strs else "No parameters."
-        lines.append(f"- {tool['name']}: {tool['description']} Parameters: {param_str}")
-        # Add usage example if present
+        lines.append(f"- {tool['name']}: {tool['description']}\n  Parameters: {param_str}")
+        # Add usage example (auto-generate if not present)
         usage_example = tool.get('usage_example')
-        if usage_example:
-            lines.append("  Example:")
-            lines.append("  " + usage_example.strip().replace("\n", "\n  "))
-    return "\n".join(lines) + "\n\n"
+        if not usage_example:
+            usage_example = f'{{"function_call": {{"name": "{tool["name"]}", "arguments": {json.dumps(example_args, ensure_ascii=False)} }} }}'
+        lines.append("  Example usage:")
+        lines.append("    " + usage_example.strip().replace("\n", "\n    "))
+    lines.append("")
+    lines.append("When you need to use a tool, call it with the correct arguments as shown above. Always use the provided variable names.")
+    return "\n".join(lines) + "\n"
 
 # Standalone function for preparing the prompt
 
@@ -54,11 +76,6 @@ def prepare_prompt(config: NodeConfig, context_manager, llm_config: LLMConfig, t
             )
         elif not rule or rule.include:
             formatted_inputs[input_id] = context
-    # Replace placeholders in template
-    for input_id, content in formatted_inputs.items():
-        placeholder = f"{{{input_id}}}"
-        if placeholder in template:
-            template = template.replace(placeholder, str(content))
     # Add tool preamble if tools are available
     tools = None
     if config.tools:
@@ -66,7 +83,15 @@ def prepare_prompt(config: NodeConfig, context_manager, llm_config: LLMConfig, t
     else:
         tools = tool_service.list_tools_with_schemas() if tool_service else []
     preamble = build_tool_preamble(tools) if tools else ""
-    prompt_with_preamble = preamble + template
+    # Build user message with all required input variables and their values
+    user_lines = [template.strip()]
+    if formatted_inputs:
+        user_lines.append("\nInput variables:")
+        for k, v in formatted_inputs.items():
+            user_lines.append(f"{k}: {v}")
+    user_message = "\n".join(user_lines)
+    # Compose final prompt as system + user message
+    prompt_with_preamble = preamble + user_message
     # Validate total token count
     try:
         total_tokens = TokenCounter.count_tokens(

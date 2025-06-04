@@ -138,9 +138,8 @@ class AiNode(BaseNode):
     async def execute(self, context: Dict[str, Any] = None, max_steps: int = 5) -> NodeExecutionResult:
         """
         Execute the text generation node using the appropriate LLM service and handle tool/function calls.
-        Implements an agentic 'thought loop':
-        - If the LLM requests a tool call, execute the tool and send the result back to the LLM for further reasoning.
-        - Repeat up to max_steps, or until the LLM returns a normal text answer.
+        - If agentic is False: single-step deterministic tool call (or LLM output)
+        - If agentic is True: agentic 'thought loop' (multi-step, tool-calling, iterative reasoning)
         """
         start_time = datetime.utcnow()
         context = context or {}
@@ -161,14 +160,172 @@ class AiNode(BaseNode):
                     execution_time=(datetime.utcnow() - start_time).total_seconds()
                 )
 
-            # Pass tools to the LLM service if present
-            tools = None
-            if self.config.tools:
-                tools = [tool.model_dump() for tool in self.config.tools]
-            else:
-                tools = self.tool_service.list_tools_with_schemas() if hasattr(self, 'tool_service') else []
+            tools = self.tool_service.list_tools_with_schemas() if hasattr(self, 'tool_service') else []
 
-            # Start the agentic loop
+            # --- Deterministic (single-step) mode ---
+            if not self.config.agentic:
+                generated_text, usage_dict, handler_error = await self.llm_service.generate(
+                    llm_config=self.llm_config,
+                    prompt=prompt_template_for_handler,
+                    context=context,
+                    tools=tools
+                )
+                tool_name, tool_args = detect_tool_call(generated_text)
+                # If tool call detected, execute tool and return output
+                if tool_name:
+                    # Normalize tool name (strip 'functions.' or 'tools.' prefix if present)
+                    if tool_name.startswith("functions."):
+                        tool_name = tool_name.split(".", 1)[1]
+                    elif tool_name.startswith("tools."):
+                        tool_name = tool_name.split(".", 1)[1]
+                    logger.info(f"Tool/function call detected: {tool_name} with args: {tool_args}")
+                    if (not tool_args or not any(tool_args.values())) and context:
+                        logger.warning(f"Tool call '{tool_name}' missing arguments. Attempting to auto-fill from context: {context}")
+                        tool_schema = None
+                        for t in tools:
+                            if t['name'] == tool_name:
+                                tool_schema = t.get('parameters_schema', {})
+                                break
+                        if tool_schema and 'properties' in tool_schema:
+                            tool_args = {}
+                            for k in tool_schema['properties'].keys():
+                                if k in context:
+                                    tool_args[k] = context[k]
+                    tool_exec_result = await self.tool_service.execute(tool_name, tool_args or {})
+                    if tool_exec_result["success"]:
+                        output = tool_exec_result["output"]
+                        end_time = datetime.utcnow()
+                        duration = (end_time - start_time).total_seconds()
+                        return NodeExecutionResult(
+                            success=True,
+                            output=output,
+                            error=None,
+                            metadata=NodeMetadata(
+                                node_id=self.config.id,
+                                node_type=self.config.type,
+                                version=self.config.metadata.version if self.config.metadata else "1.0.0",
+                                start_time=start_time,
+                                end_time=end_time,
+                                duration=duration,
+                                provider=self.config.provider
+                            ),
+                            usage=None,
+                            execution_time=duration
+                        )
+                    else:
+                        tool_error = tool_exec_result["error"]
+                        end_time = datetime.utcnow()
+                        duration = (end_time - start_time).total_seconds()
+                        return NodeExecutionResult(
+                            success=False,
+                            output=None,
+                            error=f"{error_message_prefix}{tool_error}" if tool_error else None,
+                            metadata=NodeMetadata(
+                                node_id=self.config.id,
+                                node_type=self.config.type,
+                                version=self.config.metadata.version if self.config.metadata else "1.0.0",
+                                start_time=start_time,
+                                end_time=end_time,
+                                duration=duration,
+                                provider=self.config.provider,
+                                error_type="ToolExecutionError"
+                            ),
+                            usage=None,
+                            execution_time=duration
+                        )
+                # If no tool call, check if output is a stringified function_call and handle it
+                try:
+                    parsed = None
+                    if isinstance(generated_text, str) and 'function_call' in generated_text:
+                        import json
+                        try:
+                            parsed = json.loads(generated_text)
+                        except Exception:
+                            # Try to eval if single quotes (not recommended, but fallback)
+                            import ast
+                            try:
+                                parsed = ast.literal_eval(generated_text)
+                            except Exception:
+                                parsed = None
+                    if parsed and isinstance(parsed, dict) and 'function_call' in parsed:
+                        call = parsed['function_call']
+                        tool_name = call.get('name')
+                        tool_args = call.get('arguments')
+                        if tool_name:
+                            if tool_name.startswith("functions."):
+                                tool_name = tool_name.split(".", 1)[1]
+                            elif tool_name.startswith("tools."):
+                                tool_name = tool_name.split(".", 1)[1]
+                            logger.info(f"(Stringified) Tool/function call detected: {tool_name} with args: {tool_args}")
+                            tool_exec_result = await self.tool_service.execute(tool_name, tool_args or {})
+                            if tool_exec_result["success"]:
+                                output = tool_exec_result["output"]
+                                end_time = datetime.utcnow()
+                                duration = (end_time - start_time).total_seconds()
+                                return NodeExecutionResult(
+                                    success=True,
+                                    output=output,
+                                    error=None,
+                                    metadata=NodeMetadata(
+                                        node_id=self.config.id,
+                                        node_type=self.config.type,
+                                        version=self.config.metadata.version if self.config.metadata else "1.0.0",
+                                        start_time=start_time,
+                                        end_time=end_time,
+                                        duration=duration,
+                                        provider=self.config.provider
+                                    ),
+                                    usage=None,
+                                    execution_time=duration
+                                )
+                            else:
+                                tool_error = tool_exec_result["error"]
+                                end_time = datetime.utcnow()
+                                duration = (end_time - start_time).total_seconds()
+                                return NodeExecutionResult(
+                                    success=False,
+                                    output=None,
+                                    error=f"{error_message_prefix}{tool_error}" if tool_error else None,
+                                    metadata=NodeMetadata(
+                                        node_id=self.config.id,
+                                        node_type=self.config.type,
+                                        version=self.config.metadata.version if self.config.metadata else "1.0.0",
+                                        start_time=start_time,
+                                        end_time=end_time,
+                                        duration=duration,
+                                        provider=self.config.provider,
+                                        error_type="ToolExecutionError"
+                                    ),
+                                    usage=None,
+                                    execution_time=duration
+                                )
+                except Exception:
+                    pass
+                # If no tool call, treat as normal LLM output
+                output_data, validation_success, validation_error = self._process_and_validate_output(generated_text)
+                final_success = validation_success
+                final_error = validation_error if not validation_success else None
+                end_time = datetime.utcnow()
+                duration = (end_time - start_time).total_seconds()
+                return NodeExecutionResult(
+                    success=final_success,
+                    output=output_data,
+                    error=f"{error_message_prefix}{final_error}" if final_error else None,
+                    metadata=NodeMetadata(
+                        node_id=self.config.id,
+                        node_type=self.config.type,
+                        version=self.config.metadata.version if self.config.metadata else "1.0.0",
+                        start_time=start_time,
+                        end_time=end_time,
+                        duration=duration,
+                        provider=self.config.provider,
+                        error_type="SchemaValidationError" if not final_success and validation_error else None
+                    ),
+                    usage=None,
+                    execution_time=duration
+                )
+
+            # --- Agentic (multi-step) mode ---
             last_llm_output = None
             usage_metadata = None
             while step < max_steps:
@@ -177,7 +334,6 @@ class AiNode(BaseNode):
                 if step == 1:
                     llm_input = prompt_template_for_handler
                 else:
-                    # Use the utility for tool output formatting
                     tool_output_strs = [
                         format_tool_output(t['tool_name'], t['output']) for t in tool_outputs if t['success']
                     ]
@@ -191,14 +347,30 @@ class AiNode(BaseNode):
                 )
                 last_llm_output = generated_text
 
-                # --- Tool/function call detection and handling ---
                 tool_name, tool_args = detect_tool_call(generated_text)
                 tool_call_detected = tool_name is not None
                 tool_result = None
                 tool_error = None
 
                 if tool_call_detected:
+                    # Normalize tool name (strip 'functions.' or 'tools.' prefix if present)
+                    if tool_name.startswith("functions."):
+                        tool_name = tool_name.split(".", 1)[1]
+                    elif tool_name.startswith("tools."):
+                        tool_name = tool_name.split(".", 1)[1]
                     logger.info(f"Tool/function call detected: {tool_name} with args: {tool_args}")
+                    if (not tool_args or not any(tool_args.values())) and context:
+                        logger.warning(f"Tool call '{tool_name}' missing arguments. Attempting to auto-fill from context: {context}")
+                        tool_schema = None
+                        for t in tools:
+                            if t['name'] == tool_name:
+                                tool_schema = t.get('parameters_schema', {})
+                                break
+                        if tool_schema and 'properties' in tool_schema:
+                            tool_args = {}
+                            for k in tool_schema['properties'].keys():
+                                if k in context:
+                                    tool_args[k] = context[k]
                     tool_exec_result = await self.tool_service.execute(tool_name, tool_args or {})
                     tool_outputs.append(tool_exec_result)
                     if not tool_exec_result["success"]:
@@ -224,8 +396,6 @@ class AiNode(BaseNode):
                         )
                     # Continue the loop: send tool output back to LLM for further reasoning
                     continue
-                # --- End tool/function call handling ---
-
                 if handler_error:
                     logger.error(f"{error_message_prefix}Handler error: {handler_error}")
                     return NodeExecutionResult(
@@ -234,8 +404,6 @@ class AiNode(BaseNode):
                         metadata=self._create_error_metadata(start_time, "LLMHandlerError"),
                         execution_time=(datetime.utcnow() - start_time).total_seconds()
                     )
-
-                # If no tool call detected, treat as final answer
                 output_data, validation_success, validation_error = self._process_and_validate_output(generated_text)
                 final_success = validation_success
                 final_error = validation_error if not validation_success else None
@@ -270,7 +438,6 @@ class AiNode(BaseNode):
                     usage=usage_metadata,
                     execution_time=duration
                 )
-            # If we reach here, max_steps was hit
             logger.warning(f"{error_message_prefix}Max agentic steps ({max_steps}) reached.")
             return NodeExecutionResult(
                 success=False,

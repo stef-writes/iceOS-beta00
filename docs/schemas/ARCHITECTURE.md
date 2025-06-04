@@ -3,6 +3,7 @@
 ## Core Components
 
 ### 1. Node System
+NOTE: All node logic is handled by AiNode, which supports both deterministic and agentic workflows via the agentic flag. There are no other node types at this time. If new node types are needed in the future, they can be added as required. The agentic flag controls whether a node runs in multi-step (agentic) or single-step (deterministic) mode.
 Currently implemented with:
 - `BaseNode`: Abstract base class defining node interface
 - `AiNode`: Concrete implementation for AI-powered nodes
@@ -11,9 +12,7 @@ Currently implemented with:
 ```python
 # Current node types
 node_types = {
-    "ai": "AiNode",  # Implemented
-    "tool": "ToolNode",  # Planned
-    "router": "RouterNode"  # Planned
+    "ai": "AiNode"  # Implemented
 }
 ```
 
@@ -75,7 +74,6 @@ Current implementation:
 
 1. **Node Types**
    - Only `AiNode` is fully implemented
-   - `ToolNode` and `RouterNode` are planned
 
 2. **Tool System**
    - Basic tool framework in place
@@ -90,7 +88,6 @@ Current implementation:
 ## Next Steps
 
 1. **Immediate**
-   - Implement remaining node types
    - Add more specialized tools
    - Enhance error handling
    - Improve monitoring

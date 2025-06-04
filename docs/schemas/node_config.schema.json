@@ -4,7 +4,7 @@
   "type": "object",
   "properties": {
     "id": {"type": "string", "description": "Unique identifier for the node"},
-    "type": {"type": "string", "enum": ["ai"], "description": "Type of node (e.g., 'ai')"},
+    "type": {"type": "string", "enum": ["ai"], "description": "Type of node (must be 'ai'). Only AiNode is supported. The agentic flag controls multi-step (agentic) vs. single-step (deterministic) behavior."},
     "model": {"type": "string", "description": "Model to use for the node"},
     "prompt": {"type": "string", "description": "Prompt template for the node"},
     "name": {"type": "string", "description": "Human-readable name for the node"},
@@ -80,7 +80,8 @@
         },
         "required": ["name", "parameters"]
       }
-    }
+    },
+    "agentic": {"type": "boolean", "description": "If true, run agentic multi-step loop; otherwise, run single-step deterministic logic.", "default": false}
   },
   "required": ["id", "type", "model", "provider", "prompt", "level", "dependencies"]
 } 

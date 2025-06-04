@@ -62,10 +62,27 @@ class NodeMetadata(BaseModel):
 class ToolConfig(BaseModel):
     name: str
     description: Optional[str] = None
-    parameters: Dict[str, Any]
+    parameters: Optional[Dict[str, Any]] = Field(
+        None,
+        description="(INTERNAL) JSON Schema for tool parameters. Do not provide in POST; backend will inject."
+    )
+
+    @field_validator('parameters')
+    @classmethod
+    def validate_parameters_schema(cls, v):
+        if v is not None:
+            if not isinstance(v, dict) or v.get('type') != 'object':
+                raise ValueError("ToolConfig.parameters must be a valid JSON Schema object with type: 'object'. Do not provide example values.")
+        return v
 
 class NodeConfig(BaseModel):
-    """Configuration for a node in the workflow."""
+    """Configuration for a node in the workflow.
+    
+    tools: Optional[List[ToolConfig]]
+        List of tools to enable for this node. Only the tool name and description are required; schemas are always loaded from the tool registry at runtime. Do not provide parameter schemas or example values in user POST.
+    agentic: bool
+        If true, run agentic multi-step loop; otherwise, run single-step deterministic logic.
+    """
     id: str = Field(..., description="Unique identifier for the node")
     type: str = Field(..., description="Type of node (e.g., 'ai')")
     model: str = Field(..., description="Model to use for the node")
@@ -96,6 +113,7 @@ class NodeConfig(BaseModel):
         description="Token management configuration"
     )
     tools: Optional[List[ToolConfig]] = None
+    agentic: bool = Field(default=False, description="If true, run agentic multi-step loop; otherwise, run single-step deterministic logic.")
 
     @field_validator('dependencies')
     @classmethod

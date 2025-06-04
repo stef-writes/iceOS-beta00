@@ -5,6 +5,8 @@ from typing import Any, Dict, Callable, Optional
 from app.tools.base import BaseTool
 from pydantic import ValidationError
 from app.tools import CalculatorTool
+from app.tools.transcript_parser import TranscriptParserTool
+from app.tools.speaker_lister import SpeakerListerTool
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +23,10 @@ class ToolService:
         self.timeout = timeout
 
     def register_tool(self, tool: BaseTool):
+        # Validate parameters_schema is a valid JSON Schema (type: object)
+        schema = tool.get_parameters_json_schema()
+        if not isinstance(schema, dict) or schema.get('type') != 'object':
+            raise ValueError(f"Tool '{tool.name}' parameters_schema must be a valid JSON Schema object with type: 'object'.")
         self.registry[tool.name] = tool
         logger.debug(f"Registered tool: {tool.name}")
 
@@ -82,3 +88,5 @@ class ToolService:
     def register_default_tools(service: 'ToolService'):
         """Register all default/built-in tools."""
         service.register_tool(CalculatorTool())
+        service.register_tool(TranscriptParserTool())
+        service.register_tool(SpeakerListerTool())

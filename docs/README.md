@@ -90,4 +90,41 @@ MIT License. See `LICENSE` file for details.
 
 ## Market Opportunity & Vision
 
-See [SCRIPTCHAIN_ANALYSIS.md](SCRIPTCHAIN_ANALYSIS.md) for a strategic and technical analysis of ICE.OS's potential as a startup seed. 
+See [SCRIPTCHAIN_ANALYSIS.md](SCRIPTCHAIN_ANALYSIS.md) for a strategic and technical analysis of ICE.OS's potential as a startup seed.
+
+---
+
+## Tool/Function Calling API Requirements
+
+- **Tool schemas are backend-driven:**
+  - When defining a node that uses tools/functions (for OpenAI function calling or similar), only specify the tool `name` and `description` in your node config or POST body.
+  - **Do NOT** provide parameter schemas or example values in your POST. These will be ignored.
+  - The backend will always inject the correct JSON Schema for each tool/function from the tool registry at runtime.
+  - This ensures all schemas are valid and compatible with LLM providers (e.g., OpenAI).
+  - If you attempt to register or POST a tool with an invalid schema, the backend will return a clear error.
+
+**Example NodeConfig POST (tools section):**
+```json
+{
+  "id": "parser-node-1",
+  "type": "ai",
+  "model": "gpt-4",
+  "prompt": "Parse the transcript using the transcript_parser tool.",
+  "dependencies": [],
+  "llm_config": {
+    "provider": "openai",
+    "model": "gpt-4"
+  },
+  "tools": [
+    {
+      "name": "transcript_parser",
+      "description": "Parses a raw transcript into utterances."
+    }
+  ],
+  "input_schema": {"raw_transcript_text": "str"},
+  "output_schema": {"utterances": "list"}
+}
+```
+
+- The backend will automatically attach the correct JSON Schema for `transcript_parser` at runtime.
+- This makes your API usage future-proof and robust for all tool/function calling scenarios. 

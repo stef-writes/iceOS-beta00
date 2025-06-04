@@ -4002,5 +4002,44 @@
     "version": "e1615274-855d-4a74-aadf-264a2dd0e3ab",
     "timestamp": "2025-06-01T17:34:40.688741",
     "execution_id": "5ae6e5e9-548b-4e4a-ae6b-4ff7fede354b"
+  },
+  "parser-node-1": {
+    "data": {
+      "utterances": [
+        {
+          "timestamp": "00:00:01",
+          "speaker": "Alice",
+          "text": "Hi everyone, thanks for joining."
+        },
+        {
+          "timestamp": "00:00:05",
+          "speaker": "Bob",
+          "text": "Hi Alice! Glad to be here."
+        },
+        {
+          "timestamp": "00:00:10",
+          "speaker": "Alice",
+          "text": "Today we\u2019ll discuss the new project timeline."
+        },
+        {
+          "timestamp": "00:00:15",
+          "speaker": "Carol",
+          "text": "Sounds good."
+        }
+      ]
+    },
+    "version": "84648f41-549e-44b3-97ca-6e9997dbf72d",
+    "timestamp": "2025-06-04T18:28:34.470187"
+  },
+  "speaker-lister-node-1": {
+    "data": {
+      "speakers": [
+        "Carol",
+        "Alice",
+        "Bob"
+      ]
+    },
+    "version": "6008a05b-4048-4cd0-a7dd-c046e5a4fdaf",
+    "timestamp": "2025-06-04T18:38:03.558277"
   }
 }
