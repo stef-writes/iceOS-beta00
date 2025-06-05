@@ -37,7 +37,7 @@ from app.utils.token_counter import TokenCounter
 from app.llm_providers import OpenAIHandler, AnthropicHandler, GoogleGeminiHandler, DeepSeekHandler
 from app.services.llm_service import LLMService
 from app.services.tool_service import ToolService
-from app.nodes.prompt_builder import build_tool_preamble, prepare_prompt
+from app.nodes.prompt_builder import build_tool_preamble, prepare_prompt, build_system_message_for_tool
 from app.nodes.tool_call_utils import detect_tool_call, format_tool_output
 from app.nodes.error_handling import OpenAIErrorHandler
 from app.nodes.constants import TOOL_INSTRUCTION
@@ -69,8 +69,15 @@ class AiNode(BaseNode):
         return build_tool_preamble(tools)
 
     async def prepare_prompt(self, inputs: Dict[str, Any]) -> str:
-        """Prepare prompt with selected context from inputs, including a tool preamble if tools are available."""
-        return prepare_prompt(self.config, self.context_manager, self.llm_config, self.tool_service, inputs)
+        """Prepare prompt with selected context from inputs, including a tool system message and preamble if tools are available."""
+        # If this node uses tools, prepend a system message for the first tool (or all tools if needed)
+        if self.config.tools:
+            tool = self.config.tools[0].model_dump() if hasattr(self.config.tools[0], 'model_dump') else self.config.tools[0]
+            system_msg = build_system_message_for_tool(tool)
+        else:
+            system_msg = ''
+        user_prompt = prepare_prompt(self.config, self.context_manager, self.llm_config, self.tool_service, inputs)
+        return (system_msg + '\n' + user_prompt).strip()
 
     def _truncate_prompt(self, prompt: str, current_tokens: int) -> str:
         """Truncate prompt to fit within token limit.
@@ -135,6 +142,29 @@ class AiNode(BaseNode):
         
         return messages
 
+    def _build_tool_args_from_context(self, tool_name, tool_schema, context):
+        """Build tool arguments from context and input_mappings, with error reporting."""
+        tool_args = {}
+        missing_args = []
+        if tool_schema and 'properties' in tool_schema:
+            for k in tool_schema['properties'].keys():
+                # Use input_mappings if defined
+                mapped = False
+                if self.config.input_mappings and k in self.config.input_mappings:
+                    mapping = self.config.input_mappings[k]
+                    dep_context = self.context_manager.get_node_output(mapping.source_node_id)
+                    value = dep_context.get(mapping.source_output_key)
+                    if value is not None:
+                        tool_args[k] = value
+                        mapped = True
+                if not mapped:
+                    # Fallback: get from this node's context
+                    if k in context:
+                        tool_args[k] = context[k]
+                    else:
+                        missing_args.append(k)
+        return tool_args, missing_args
+
     async def execute(self, context: Dict[str, Any] = None, max_steps: int = 5) -> NodeExecutionResult:
         """
         Execute the text generation node using the appropriate LLM service and handle tool/function calls.
@@ -148,9 +178,9 @@ class AiNode(BaseNode):
         tool_outputs = []
         step = 0
         try:
-            # Prepare the initial prompt
+            # Prepare the initial prompt (instructions only, no data)
             try:
-                prompt_template_for_handler = await self.prepare_prompt(context)
+                prompt_template_for_handler = await self.prepare_prompt({})  # Pass empty dict to avoid data in prompt
             except KeyError as e:
                 logger.error(f"{error_message_prefix}Missing key '{str(e)}' for prompt template. Context: {json.dumps(context, indent=2, default=str)}", exc_info=True)
                 return NodeExecutionResult(
@@ -167,31 +197,37 @@ class AiNode(BaseNode):
                 generated_text, usage_dict, handler_error = await self.llm_service.generate(
                     llm_config=self.llm_config,
                     prompt=prompt_template_for_handler,
-                    context=context,
+                    context={},  # No data in context for prompt
                     tools=tools
                 )
-                tool_name, tool_args = detect_tool_call(generated_text)
-                # If tool call detected, execute tool and return output
-                if tool_name:
-                    # Normalize tool name (strip 'functions.' or 'tools.' prefix if present)
+                tool_name, _ = detect_tool_call(generated_text)
+                # If this node is configured with a tool, always call the tool with context-derived arguments
+                if self.config.tools and len(self.config.tools) > 0:
+                    # If LLM didn't select a tool, default to the first tool
+                    if not tool_name:
+                        tool_name = self.config.tools[0].name
                     if tool_name.startswith("functions."):
                         tool_name = tool_name.split(".", 1)[1]
                     elif tool_name.startswith("tools."):
                         tool_name = tool_name.split(".", 1)[1]
-                    logger.info(f"Tool/function call detected: {tool_name} with args: {tool_args}")
-                    if (not tool_args or not any(tool_args.values())) and context:
-                        logger.warning(f"Tool call '{tool_name}' missing arguments. Attempting to auto-fill from context: {context}")
-                        tool_schema = None
-                        for t in tools:
-                            if t['name'] == tool_name:
-                                tool_schema = t.get('parameters_schema', {})
-                                break
-                        if tool_schema and 'properties' in tool_schema:
-                            tool_args = {}
-                            for k in tool_schema['properties'].keys():
-                                if k in context:
-                                    tool_args[k] = context[k]
-                    tool_exec_result = await self.tool_service.execute(tool_name, tool_args or {})
+                    logger.info(f"[DETERMINISTIC] Forcing tool/function call: {tool_name} (ignoring LLM args, using context)")
+                    tool_schema = None
+                    for t in tools:
+                        if t['name'] == tool_name:
+                            tool_schema = t.get('parameters_schema', {})
+                            break
+                    tool_args, missing_args = self._build_tool_args_from_context(tool_name, tool_schema, context)
+                    if missing_args:
+                        error_msg = f"Missing required tool arguments in context: {missing_args}"
+                        logger.error(error_msg)
+                        return NodeExecutionResult(
+                            success=False,
+                            output=None,
+                            error=f"{error_message_prefix}{error_msg}",
+                            metadata=self._create_error_metadata(start_time, "ToolArgumentError"),
+                            execution_time=(datetime.utcnow() - start_time).total_seconds()
+                        )
+                    tool_exec_result = await self.tool_service.execute(tool_name, tool_args)
                     if tool_exec_result["success"]:
                         output = tool_exec_result["output"]
                         end_time = datetime.utcnow()
@@ -233,75 +269,7 @@ class AiNode(BaseNode):
                             usage=None,
                             execution_time=duration
                         )
-                # If no tool call, check if output is a stringified function_call and handle it
-                try:
-                    parsed = None
-                    if isinstance(generated_text, str) and 'function_call' in generated_text:
-                        import json
-                        try:
-                            parsed = json.loads(generated_text)
-                        except Exception:
-                            # Try to eval if single quotes (not recommended, but fallback)
-                            import ast
-                            try:
-                                parsed = ast.literal_eval(generated_text)
-                            except Exception:
-                                parsed = None
-                    if parsed and isinstance(parsed, dict) and 'function_call' in parsed:
-                        call = parsed['function_call']
-                        tool_name = call.get('name')
-                        tool_args = call.get('arguments')
-                        if tool_name:
-                            if tool_name.startswith("functions."):
-                                tool_name = tool_name.split(".", 1)[1]
-                            elif tool_name.startswith("tools."):
-                                tool_name = tool_name.split(".", 1)[1]
-                            logger.info(f"(Stringified) Tool/function call detected: {tool_name} with args: {tool_args}")
-                            tool_exec_result = await self.tool_service.execute(tool_name, tool_args or {})
-                            if tool_exec_result["success"]:
-                                output = tool_exec_result["output"]
-                                end_time = datetime.utcnow()
-                                duration = (end_time - start_time).total_seconds()
-                                return NodeExecutionResult(
-                                    success=True,
-                                    output=output,
-                                    error=None,
-                                    metadata=NodeMetadata(
-                                        node_id=self.config.id,
-                                        node_type=self.config.type,
-                                        version=self.config.metadata.version if self.config.metadata else "1.0.0",
-                                        start_time=start_time,
-                                        end_time=end_time,
-                                        duration=duration,
-                                        provider=self.config.provider
-                                    ),
-                                    usage=None,
-                                    execution_time=duration
-                                )
-                            else:
-                                tool_error = tool_exec_result["error"]
-                                end_time = datetime.utcnow()
-                                duration = (end_time - start_time).total_seconds()
-                                return NodeExecutionResult(
-                                    success=False,
-                                    output=None,
-                                    error=f"{error_message_prefix}{tool_error}" if tool_error else None,
-                                    metadata=NodeMetadata(
-                                        node_id=self.config.id,
-                                        node_type=self.config.type,
-                                        version=self.config.metadata.version if self.config.metadata else "1.0.0",
-                                        start_time=start_time,
-                                        end_time=end_time,
-                                        duration=duration,
-                                        provider=self.config.provider,
-                                        error_type="ToolExecutionError"
-                                    ),
-                                    usage=None,
-                                    execution_time=duration
-                                )
-                except Exception:
-                    pass
-                # If no tool call, treat as normal LLM output
+                # If no tool is configured, fall back to validating LLM output
                 output_data, validation_success, validation_error = self._process_and_validate_output(generated_text)
                 final_success = validation_success
                 final_error = validation_error if not validation_success else None
@@ -353,25 +321,22 @@ class AiNode(BaseNode):
                 tool_error = None
 
                 if tool_call_detected:
-                    # Normalize tool name (strip 'functions.' or 'tools.' prefix if present)
                     if tool_name.startswith("functions."):
                         tool_name = tool_name.split(".", 1)[1]
                     elif tool_name.startswith("tools."):
                         tool_name = tool_name.split(".", 1)[1]
                     logger.info(f"Tool/function call detected: {tool_name} with args: {tool_args}")
-                    if (not tool_args or not any(tool_args.values())) and context:
-                        logger.warning(f"Tool call '{tool_name}' missing arguments. Attempting to auto-fill from context: {context}")
-                        tool_schema = None
-                        for t in tools:
-                            if t['name'] == tool_name:
-                                tool_schema = t.get('parameters_schema', {})
-                                break
-                        if tool_schema and 'properties' in tool_schema:
-                            tool_args = {}
-                            for k in tool_schema['properties'].keys():
-                                if k in context:
-                                    tool_args[k] = context[k]
-                    tool_exec_result = await self.tool_service.execute(tool_name, tool_args or {})
+                    tool_schema = None
+                    for t in tools:
+                        if t['name'] == tool_name:
+                            tool_schema = t.get('parameters_schema', {})
+                            break
+                    # Always build tool_args from context, ignore LLM args
+                    tool_args, missing_args = self._build_tool_args_from_context(tool_name, tool_schema, context)
+                    if missing_args:
+                        logger.warning(f"Tool call '{tool_name}' missing arguments. Attempting to auto-fill from context failed: {missing_args}")
+                        continue  # Skip this tool call, go to next agentic step
+                    tool_exec_result = await self.tool_service.execute(tool_name, tool_args)
                     tool_outputs.append(tool_exec_result)
                     if not tool_exec_result["success"]:
                         tool_error = tool_exec_result["error"]
@@ -619,81 +584,75 @@ class AiNode(BaseNode):
 
     def _process_and_validate_output(self, generated_text: str) -> Tuple[Dict[str, Any], bool, Optional[str]]:
         """Processes the raw text from LLM and validates against output_schema.
-        
-        Simple, flexible approach:
-        1. Try JSON parsing first
-        2. If that fails, handle as plain text based on schema
-        3. Default to wrapping in 'text' key if no schema
+        Robustly handles function_call wrappers, stringified JSON, and schema validation for any node.
         """
         logger.debug(f"[_PVP] Raw generated_text: '{generated_text}'")
-        output = {}
-        
-        # Strategy 1: Try JSON parsing (for structured responses)
-        try:
-            parsed_json = json.loads(generated_text.strip())
-            if isinstance(parsed_json, dict):
-                output = parsed_json
-                logger.debug(f"[_PVP] Successfully parsed as JSON: {output}")
-            else:
-                # JSON but not a dict (e.g., just a string or number)
-                raise ValueError("Not a dictionary")
-        except (json.JSONDecodeError, ValueError):
-            # Strategy 2: Handle as plain text
-            logger.debug(f"[_PVP] Not JSON, handling as plain text")
-            
-            if self.config.output_schema:
-                # If schema exists, try to fit the text into it
-                if len(self.config.output_schema) == 1:
-                    # Single field schema - put entire text there
-                    key = list(self.config.output_schema.keys())[0]
-                    expected_type = self.config.output_schema[key]
-                    
-                    if expected_type == "str":
-                        output[key] = generated_text.strip()
-                    elif expected_type == "int":
-                        # Extract first number, fail if no valid number found
-                        numbers = re.findall(r'-?\d+', generated_text)
-                        if not numbers:
-                            return {}, False, f"Output schema validation failed: No valid integer found in '{generated_text}'"
-                        try:
-                            output[key] = int(numbers[0])
-                        except ValueError:
-                            return {}, False, f"Output schema validation failed: Could not convert '{numbers[0]}' to integer"
-                    elif expected_type == "float":
-                        # Extract first float, fail if no valid float found
-                        numbers = re.findall(r'-?\d*\.?\d+', generated_text)
-                        if not numbers:
-                            return {}, False, f"Output schema validation failed: No valid float found in '{generated_text}'"
-                        output[key] = float(numbers[0])
-                    else:
-                        # For other types, convert string
-                        output[key] = generated_text.strip()
-                else:
-                    # Multiple fields - try to extract or put in first string field
-                    for key, expected_type in self.config.output_schema.items():
-                        if expected_type == "str":
-                            output[key] = generated_text.strip()
-                            break
-            else:
-                # No schema - default behavior
-                output["text"] = generated_text.strip()
-        
-        # Validate against schema
+        output = None
+        error = None
+
+        def try_parse_json(val):
+            try:
+                return json.loads(val)
+            except Exception:
+                return None
+
+        # Step 1: Try direct JSON
+        parsed = try_parse_json(generated_text.strip())
+
+        # Step 2: If function_call wrapper, extract arguments
+        if isinstance(parsed, dict) and "function_call" in parsed:
+            call = parsed["function_call"]
+            args = call.get("arguments")
+            if isinstance(args, str):
+                parsed = try_parse_json(args)
+            elif isinstance(args, dict):
+                parsed = args
+
+        # Step 3: If still a string, try parsing again
+        if isinstance(parsed, str):
+            parsed = try_parse_json(parsed)
+
+        # Step 4: If still not a dict, fallback to empty dict
+        if not isinstance(parsed, dict):
+            parsed = {}
+
+        output = parsed
+
+        # Step 5: Validate against output_schema
         if self.config.output_schema:
             for key, expected_type in self.config.output_schema.items():
                 if key not in output:
                     return {}, False, f"Output schema validation failed: Missing key '{key}' (expected type '{expected_type}')"
-                    
-                # Type conversion if needed
+                value = output[key]
                 try:
-                    if expected_type == "str" and not isinstance(output[key], str):
-                        output[key] = str(output[key])
-                    elif expected_type == "int" and not isinstance(output[key], int):
-                        output[key] = int(output[key])
-                    elif expected_type == "float" and not isinstance(output[key], (int, float)):
-                        output[key] = float(output[key])
+                    if expected_type == "list":
+                        if not isinstance(value, list):
+                            # Try to parse as JSON list if it's a string
+                            if isinstance(value, str):
+                                value = try_parse_json(value)
+                            if not isinstance(value, list):
+                                return {}, False, f"Output schema validation failed: '{key}' is not a valid JSON list"
+                        # If this is the utterances field, check structure
+                        if key == "utterances":
+                            for i, item in enumerate(value):
+                                if not isinstance(item, dict) or not all(k in item for k in ("timestamp", "speaker", "text")):
+                                    return {}, False, f"Output schema validation failed: Item {i} in '{key}' is not a valid utterance dict"
+                        output[key] = value
+                    elif expected_type == "str":
+                        if not isinstance(value, str):
+                            value = str(value)
+                        output[key] = value
+                    elif expected_type == "int":
+                        if not isinstance(value, int):
+                            value = int(value)
+                        output[key] = value
+                    elif expected_type == "float":
+                        if not isinstance(value, (int, float)):
+                            value = float(value)
+                        output[key] = value
+                    else:
+                        output[key] = value
                 except (ValueError, TypeError) as e:
                     return {}, False, f"Output schema validation failed: Cannot convert '{output[key]}' to {expected_type} for key '{key}': {str(e)}"
-        
         logger.debug(f"[_PVP] Final output: {output}")
         return output, True, None
